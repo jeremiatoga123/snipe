@@ -1,0 +1,23 @@
+{
+  "name": "mintopensea",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Direct-contract NFT mint tool (Robinhood Chain / any EVM chain)",
+  "bin": {
+    "mintos": "src/index.js"
+  },
+  "scripts": {
+    "info": "node src/index.js info",
+    "mint": "node src/index.js mint",
+    "watch": "node src/index.js watch"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.4"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

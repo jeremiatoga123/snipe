@@ -1,0 +1,20 @@
+node_modules/
+.env
+keys.txt
+*.log
+.cache/
+.playwright-mcp/
+
+# Konfigurasi izin Claude Code - berisi perintah lokal beserta kredensial.
+# JANGAN pernah di-commit.
+.claude/
+
+# File sementara
+*.tar.gz
+*.b64
+_strip.mjs
+probe*.mjs
+measure-*.mjs
+rank-*.mjs
+diag-*.mjs
+timing-test.mjs
