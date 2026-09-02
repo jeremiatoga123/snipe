@@ -177,6 +177,8 @@ function nextStep(plan, drop) {
       return 'jendela public drop sudah lewat. Tidak ada yang bisa dilakukan sampai kreator membukanya lagi.';
     case 'signature_required':
       return 'drop ini benar-benar butuh tanda tangan server OpenSea (terbukti dari revert). Mint mandiri tidak mungkin.';
+    case 'sold_out':
+      return `SUDAH HABIS (${drop.probeReason}). Tidak ada yang tersisa untuk di-mint. Laporkan ke user, jangan menembak.`;
     case 'no_public_drop':
       return 'kontrak tidak punya konfigurasi public drop; kemungkinan mint hanya lewat allowlist/signed.';
     default:
@@ -367,7 +369,7 @@ server.registerTool('mint_plan', {
       : { current: profile.totalSupply, max: profile.maxSupply },
     alreadyMintedByThisWallet: stats?.minterNumMinted ?? null,
     drop,
-    mintable: Boolean(plan),
+    mintable: Boolean(plan) && (drop ? drop.snipeable !== false : true),
     priceEthPerTx: plan ? ethers.formatEther(plan.value) : null,
     how: plan?.how ?? null,
     walletCount: ws.length,

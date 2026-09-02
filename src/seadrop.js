@@ -91,6 +91,17 @@ export async function probePublicMint(provider, sd, from) {
   const d = sd.publicDrop;
   if (!d) return { status: 'no_public_drop', snipeable: false };
 
+  const stats = await readMintStats(provider, sd.nft, from);
+  if (stats && stats.maxSupply > 0n && stats.currentTotalSupply >= stats.maxSupply) {
+    return {
+      status: 'sold_out',
+      snipeable: false,
+      reason: `sudah habis: ${stats.currentTotalSupply}/${stats.maxSupply}`,
+      supply: stats.currentTotalSupply,
+      maxSupply: stats.maxSupply,
+    };
+  }
+
   const feeRecipient = sd.feeRecipients?.[0] ?? ethers.ZeroAddress;
   const data = SEADROP_ABI.encodeFunctionData('mintPublic', [
     sd.nft, feeRecipient, ethers.ZeroAddress, 1n,
