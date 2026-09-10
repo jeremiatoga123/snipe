@@ -139,9 +139,11 @@ export async function measureSecondBoundaryViaFeed(feedUrl, { seconds = 8, drain
       try { ws && ws.close(); } catch {}
       const xs = [...firstSeen.values()].sort((a, b) => a - b);
       if (!xs.length) return resolve({ ok: false, boundaryOffsetMs: 0, samples: 0, source: 'feed', ...extra });
+      const lowMs = xs[Math.floor(xs.length * 0.25)];
       resolve({
         ok: true, source: 'feed',
-        boundaryOffsetMs: xs[Math.floor(xs.length / 2)],
+        boundaryOffsetMs: lowMs, lowMs,
+        medianMs: xs[Math.floor(xs.length / 2)],
         minMs: xs[0], spreadMs: xs[xs.length - 1] - xs[0], samples: xs.length,
         ...extra,
       });
@@ -168,14 +170,36 @@ export async function measureSecondBoundaryViaFeed(feedUrl, { seconds = 8, drain
   });
 }
 
+export const RPC_BOUNDARY_MAX_SPREAD_MS = 150;
+
+export function rpcBoundaryTrusted(rpc) {
+  return !!(rpc && rpc.ok && rpc.samples >= 3 && Number.isFinite(rpc.spreadMs) && rpc.spreadMs <= RPC_BOUNDARY_MAX_SPREAD_MS);
+}
+
 export async function measureBoundaryRobust(provider, feedUrl, opts = {}) {
   let rpc = null;
   try { rpc = await measureSecondBoundary(provider, opts.rpc); } catch { rpc = null; }
-  if (rpc && rpc.ok && rpc.samples >= 2) return { ...rpc, source: 'rpc' };
-  const feed = await measureSecondBoundaryViaFeed(feedUrl, opts.feed);
-  if (feed.ok) return feed;
-  if (rpc && rpc.ok) return { ...rpc, source: 'rpc' };
-  return { ok: false, boundaryOffsetMs: 0, samples: 0, source: 'none' };
+  if (rpcBoundaryTrusted(rpc)) return { ...rpc, source: 'rpc' };
+  const rpcNote = rpc && rpc.ok ? `rpc ditolak: sebaran ${Math.round(rpc.spreadMs)}ms dari ${rpc.samples} sampel` : 'rpc gagal';
+  let feed = await measureSecondBoundaryViaFeed(feedUrl, opts.feed);
+  if (!feed.ok && feed.error) feed = await measureSecondBoundaryViaFeed(feedUrl, opts.feed);
+  if (feed.ok && feed.samples >= 3) return { ...feed, note: rpcNote };
+  if (rpc && rpc.ok) return { ...rpc, source: 'rpc', note: `${rpcNote}; feed juga gagal, terpaksa pakai rpc` };
+  if (feed.ok) return { ...feed, note: rpcNote };
+  return { ok: false, boundaryOffsetMs: 0, samples: 0, source: 'none', note: rpcNote };
+}
+
+export function estimateDeliveryMs(seqRttMs, fallback = 300) {
+  if (!Number.isFinite(seqRttMs) || seqRttMs <= 0) return fallback ?? 300;
+  return Math.round(Math.min(600, Math.max(100, 135 + 0.76 * seqRttMs)));
+}
+
+export function resolveDeliveryMs(cfg, chain, seqRttMs) {
+  if (cfg.deliveryMs != null && cfg.deliveryMs !== '') return { deliveryMs: Number(cfg.deliveryMs), deliverySource: 'flag' };
+  const env = process.env.DELIVERY_MS;
+  if (env != null && env !== '' && Number.isFinite(Number(env))) return { deliveryMs: Number(env), deliverySource: 'env' };
+  if (Number.isFinite(seqRttMs) && seqRttMs > 0) return { deliveryMs: estimateDeliveryMs(seqRttMs, chain.deliveryMs), deliverySource: 'auto' };
+  return { deliveryMs: chain.deliveryMs ?? null, deliverySource: 'chain' };
 }
 
 export function computeArrivalAt(startTimeSec, { boundaryOffsetMs, leadMs = 0 }) {
@@ -298,11 +322,14 @@ export async function preflight({ provider, wallets, cfg, chain, quiet = false }
   const boundary = await measureBoundaryRobust(provider, chain.feed);
   const seqLat = await measureSequencerLatency(chain.sequencer, 7);
   const conditionalOk = chain.sequencer ? await supportsConditional(chain.sequencer) : false;
+  const delivery = resolveDeliveryMs(cfg, chain, seqLat.medianMs);
   say(
     `latensi RPC ${lat.medianMs.toFixed(0)}ms | sequencer ${seqLat.medianMs ? seqLat.medianMs.toFixed(0) + 'ms' : '-'}` +
-    ` | batas detik +${boundary.boundaryOffsetMs.toFixed(0)}ms via ${boundary.source}${boundary.ok ? '' : ' (gagal diukur, pakai 0)'}` +
+    ` | batas detik +${boundary.boundaryOffsetMs.toFixed(0)}ms via ${boundary.source}${Number.isFinite(boundary.spreadMs) ? ` (sebaran ${boundary.spreadMs.toFixed(0)}ms)` : ''}${boundary.ok ? '' : ' (gagal diukur, pakai 0)'}` +
+    ` | kompensasi kirim ${delivery.deliveryMs ?? '-'}ms (${delivery.deliverySource})` +
     ` | bersyarat: ${conditionalOk ? 'ya' : 'tidak'}`
   );
+  if (boundary.note) say(`catatan batas detik: ${boundary.note}`);
 
   const { offsetMs, samples } = await measureClockOffset(provider);
 
@@ -318,7 +345,8 @@ export async function preflight({ provider, wallets, cfg, chain, quiet = false }
     openAtMs, scheduleSource: source, offsetMs,
     latencyMs: lat.medianMs, boundaryOffsetMs: boundary.boundaryOffsetMs, boundaryOk: boundary.ok,
     boundarySource: boundary.source, seqLatencyMs: seqLat.medianMs, conditionalOk,
-    deliveryMs: cfg.deliveryMs != null ? Number(cfg.deliveryMs) : (chain.deliveryMs ?? null),
+    deliveryMs: delivery.deliveryMs, deliverySource: delivery.deliverySource,
+    boundarySpreadMs: boundary.spreadMs ?? null, boundaryNote: boundary.note ?? null,
     totalTx: armed.length * txPerWallet,
   };
 }
@@ -404,15 +432,18 @@ export async function snipe({ provider, providers, wallets, cfg, chain, onEvent 
           }),
           measureSequencerLatency(chain.sequencer, 5),
         ]);
-        if (b2.ok) { bundle.boundaryOffsetMs = b2.boundaryOffsetMs; bundle.boundarySource = b2.source; }
+        if (b2.ok) { bundle.boundaryOffsetMs = b2.boundaryOffsetMs; bundle.boundarySource = b2.source; bundle.boundarySpreadMs = b2.spreadMs ?? null; bundle.boundaryNote = b2.note ?? null; }
         bundle.latencyMs = lat2.medianMs;
         if (s2.medianMs) bundle.seqLatencyMs = s2.medianMs;
+        if (bundle.deliverySource === 'auto' && s2.medianMs) bundle.deliveryMs = estimateDeliveryMs(s2.medianMs, chain.deliveryMs);
         firePlan = firstSendAt(bundle, cfg);
         target = firePlan.sendAt;
         onEvent({
           type: 'resync', fireAt: target, mode: firePlan.mode, arrivalMs: firePlan.arrivalMs,
           boundaryOffsetMs: bundle.boundaryOffsetMs, boundarySource: bundle.boundarySource,
+          boundarySpreadMs: bundle.boundarySpreadMs, boundaryNote: bundle.boundaryNote,
           latencyMs: bundle.latencyMs, seqLatencyMs: bundle.seqLatencyMs,
+          deliveryMs: bundle.deliveryMs, deliverySource: bundle.deliverySource,
         });
       }
 
@@ -634,6 +665,11 @@ export function printArmed(bundle, chain) {
   log.plain(`   gasLimit    : ${bundle.gasLimit}`);
   log.plain(`   maxFee      : ${ethers.formatUnits(bundle.maxFee, 'gwei')} gwei`);
   log.plain(`   wallet siap : ${bundle.armed.length} (${bundle.totalTx} tx sudah ditandatangani)`);
+  if (bundle.boundarySource) {
+    const spread = Number.isFinite(bundle.boundarySpreadMs) ? `, sebaran ${Math.round(bundle.boundarySpreadMs)}ms` : '';
+    log.plain(`   batas detik : +${Math.round(bundle.boundaryOffsetMs)}ms via ${bundle.boundarySource}${spread}${bundle.boundaryNote ? ` ${c.dim}(${bundle.boundaryNote})${c.reset}` : ''}`);
+  }
+  if (bundle.deliveryMs != null) log.plain(`   kompensasi  : ${Math.round(bundle.deliveryMs)}ms (${bundle.deliverySource}) dari RTT sequencer ${bundle.seqLatencyMs ? Math.round(bundle.seqLatencyMs) + 'ms' : '-'}`);
   for (const s of bundle.skipped) log.warn(`   dilewati ${short(s.wallet)}: ${s.reason}`);
   if (bundle.openAtMs) {
     const d = new Date(bundle.openAtMs);

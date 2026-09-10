@@ -202,3 +202,16 @@ mengira itu hal yang penting.** RTT `poke` ke sequencer mudah diukur dan
 stabil, tapi bukan waktu yang dialami transaksi sungguhan. Satu-satunya
 pengukuran yang sah untuk sniper adalah transaksi sungguhan yang dicatat blok
 pendaratannya, dan itu murah: 21.000 gas, ~$0,02.
+
+### H8. Batas detik dari RPC yang basi dipercaya begitu saja
+`src/sniper.js` — `measureBoundaryRobust`
+
+Feed hanya dipakai kalau RPC *gagal*. Dari Linode Chicago, Alchemy tidak gagal:
+ia menjawab dalam 25 ms, tapi bloknya datang bergerombol sehingga perubahan
+timestamp terlihat kapan saja dalam satu detik. Median lima sampel meleset
+300–600 ms dan tool dengan yakin menjadwalkan tembakan setengah detik
+terlambat. Dari Singapura tidak pernah terlihat karena backend Alchemy di sana
+kebetulan mulus. Sekarang sebaran sampel diperiksa: > 150 ms berarti data
+tidak bisa dipercaya, pindah ke feed. Pelajaran: sumber data yang *menjawab*
+belum tentu sumber data yang *benar*, dan ukuran kualitas harus ikut dibawa,
+bukan cuma nilainya.

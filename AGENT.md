@@ -259,8 +259,38 @@ Setelah kompensasi diganti ke `deliveryMs = 300` (kirim ~60–90 ms **sebelum**
 detik bulat, lewat Alchemy + langsung): mendarat di **blok ke-2 dan ke-3**,
 tidak ada yang kepagian. Itu default sekarang.
 
-Konsekuensi untuk kolokasi: VPS di us-east-2 hanya memangkas ~230 ms
-perjalanan; ~500 ms proses ingest tetap ada. Tidak sepadan.
+Kesimpulan "ada ~500 ms proses ingest" di atas ternyata salah. Diukur ulang
+11 September 2026 dari Linode Chicago (us-ord), ~10 ms dari sequencer:
+
+| | Singapura | Chicago |
+|---|---|---|
+| RTT poke sequencer | 235 ms | **12 ms** |
+| Ack tx sungguhan, langsung ke sequencer | 750 ms | **126 ms** |
+| Ack tx sungguhan, via Alchemy | 430 ms | **156 ms** |
+
+Yang tadinya terlihat seperti proses ingest adalah tiga kali perjalanan
+bolak-balik (TCP, TLS, lalu permintaan) dari jauh. Dari dekat semuanya hilang.
+Kolokasi **sepadan**: VPS di pantai timur AS memangkas ~300–600 ms.
+
+Tapi ada jebakan baru di sana. **Membaca chain lewat Alchemy dari Chicago
+tidak bisa dipakai untuk mengukur batas detik**: blok datang bergerombol
+(hanya 3–6 blok berbeda terlihat per detik, padahal chain membuat ~10), jadi
+median batas detik meleset 300–600 ms dengan sebaran ~780 ms. RPC publik
+Robinhood lebih parah: tertinggal 0,5–1 detik. Yang benar hanya feed
+sequencer, yang dari Chicago memberi batas +140 sampai +170 ms (kuartil bawah).
+Ground truth dari tx sungguhan: batas sebenarnya sekitar +20 sampai +120 ms.
+
+Karena itu sekarang:
+
+- Batas detik dari RPC **ditolak** kalau sebaran sampelnya > 150 ms atau
+  sampelnya < 3; tool lalu memakai feed. Feed memakai kuartil bawah, bukan
+  median, karena derau feed hanya ke satu arah (terlambat, tidak pernah lebih
+  awal). Sumber dan sebarannya dicetak di "Sniper siap".
+- `deliveryMs` **dihitung otomatis** dari RTT sequencer:
+  `135 + 0,76 × RTT`, dibatasi 100–600 ms. Dua titik kalibrasinya: Singapura
+  (RTT 235 → 314, terbukti mendarat blok ke-2/3 tanpa kepagian) dan Chicago
+  (RTT 12 → 144, ack terukur 126–156 ms). Flag `--deliveryMs` atau env
+  `DELIVERY_MS` menimpanya kalau kamu mengukur sendiri.
 
 ### Siapa yang duluan mendarat — dan tembakan berjenjang
 
