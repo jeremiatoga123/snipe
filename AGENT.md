@@ -98,8 +98,9 @@ Prosesnya:
    (busy-wait 20 ms terakhir).
 4. **Tembak** — broadcast semua tx yang sudah ditandatangani serentak ke
    semua RPC. Yang tersisa saat detik pembukaan hanya satu `eth_sendRawTransaction`.
-5. **Susulan** — kalau semua gagal, tanda tangan ulang dengan nonce terbaru dan
-   coba lagi selama `retryWindowMs`.
+5. **Susulan** — wallet yang tx-nya belum mendarat ditandatangani ulang dengan
+   nonce terbaru dan ditembak lagi selama `retryWindowMs`. Wallet yang sudah
+   mendarat (atau jumlah mint on-chain-nya naik) tidak diulang.
 
 Kalau jadwalnya tidak ada di chain (bukan SeaDrop, dan `--at` tidak diisi),
 `snipe` otomatis pindah ke polling simulasi tiap `pollIntervalMs` dan menembak
@@ -142,6 +143,8 @@ berikutnya hanya mengambil blok baru.
 | `--wallets <file>` | `keys.txt` | file private key |
 | `--at <iso\|unix>` | — | paksa waktu buka kalau tidak ada di chain |
 | `--leadMs <n>` | 0 | geser tembakan; negatif = lebih awal |
+| `--stagger <ms,ms,...>` | — | target tiba per wallet, mis. `-20,40,100`; butuh ≥2 wallet |
+| `--deliveryMs <n>` | 300 (Robinhood) | perkiraan kirim→diterima sequencer, dipakai untuk mengawali tembakan |
 | `--retryWindowMs <n>` | 20000 | lama mencoba lagi kalau gelombang pertama gagal |
 | `--pollIntervalMs <n>` | 250 | jarak polling kalau jadwal tidak diketahui |
 | `--maxFeeGwei <n>` | otomatis | patok gas manual |
@@ -151,7 +154,7 @@ berikutnya hanya mengambil blok baru.
 | `--rpc <url>` | dari `.env` | RPC custom |
 
 Semua juga bisa lewat env: `AGENT_CONTRACT`, `AGENT_QTY`, `AGENT_KEYS`,
-`AGENT_AT`, `AGENT_CHAIN`, `AGENT_MAX_FEE_GWEI`, `RPC_URL`.
+`AGENT_AT`, `AGENT_CHAIN`, `AGENT_MAX_FEE_GWEI`, `AGENT_STAGGER`, `RPC_URL`.
 
 ## Soal waktu
 
@@ -258,6 +261,36 @@ tidak ada yang kepagian. Itu default sekarang.
 
 Konsekuensi untuk kolokasi: VPS di us-east-2 hanya memangkas ~230 ms
 perjalanan; ~500 ms proses ingest tetap ada. Tidak sepadan.
+
+### Siapa yang duluan mendarat — dan tembakan berjenjang
+
+Sepuluh drop SeaDrop terakhir di Robinhood ditelusuri: mint publik pertama
+umumnya baru mendarat di **blok ke-205** detik pembukaan (median, ≈ +20 detik);
+kebanyakan orang mint lewat UI. Satu bot mendarat di **blok ke-3** (≈ +0,2 s)
+memakai tiga wallet yang ditembak berselang beberapa puluh ms. Dengan
+`deliveryMs = 300`, tool ini mendarat di blok ke-2/ke-3 — setara, bukan di
+depan. Blok pertama hanya bisa dikejar dengan menerima risiko kepagian.
+
+Karena satu tembakan tidak bisa sekaligus aman dan paling awal, tembakannya
+dibagi ke beberapa wallet dengan target tiba berbeda:
+
+```bash
+node agent-mint.mjs snipe --contract 0x... --wallets keys.txt --stagger -20,40,100
+```
+
+- Wallet ke-*i* mendapat offset ke-*i* (wallet berlebih memakai offset terakhir).
+  Negatif = tiba **sebelum** batas detik terukur; itu tebakan bahwa batas
+  sebenarnya lebih awal dari median, dan bisa revert `NotActive`.
+- Tiap wallet menandatangani tx-nya sendiri dan dikirim pada
+  `tiba − deliveryMs` masing-masing; satu `Promise.all` menjadwalkannya.
+- Susulan hanya menembak ulang wallet yang belum mendarat. Yang kepagian
+  dicoba lagi, yang sudah masuk dibiarkan — jadi tidak ada mint ganda.
+- Setiap wallet cukup diisi biaya gas satu-dua tx (Robinhood: ~0,0005 ETH
+  untuk mint gratis) ditambah harga mint kalau berbayar.
+
+Lewat MCP: `mint_snipe` menerima `stagger_ms: [-20, 40, 100]`; wallet
+diambil dari `set_pk` sesuai urutan. Satu wallet saja → flag diabaikan dan
+jadwal aman (`safetyMs`) yang dipakai.
 
 ## Contoh pemakaian dari agent
 

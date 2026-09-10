@@ -452,8 +452,9 @@ server.registerTool('mint_snipe', {
     at: z.string().optional().describe('waktu buka manual (ISO 8601 atau unix), kalau jadwalnya tidak ada di chain'),
     max_wait_sec: z.number().int().min(1).max(3600).optional().describe('batal kalau harus menunggu lebih lama dari ini, default 900'),
     dry_run: z.boolean().optional().describe('rehearsal: jalan sampai fase tembak tanpa mengirim tx'),
+    stagger_ms: z.array(z.number()).optional().describe('HANYA kalau ada >1 wallet: offset tiba per wallet dalam ms relatif batas detik, mis. [-20, 40, 100]. Wallet pertama paling agresif (bisa revert kalau kepagian), berikutnya makin aman. Tanpa ini semua wallet menembak bersamaan.'),
   },
-}, async ({ contract, confirm_token, quantity = 1, tx_per_wallet = 1, at, max_wait_sec = 900, dry_run, chain: chainName }) => {
+}, async ({ contract, confirm_token, quantity = 1, tx_per_wallet = 1, at, max_wait_sec = 900, dry_run, stagger_ms, chain: chainName }) => {
   if (!ethers.isAddress(contract)) return err(`alamat tidak valid: ${contract}`);
   const address = ethers.getAddress(contract);
   const chain = currentChain(chainName);
@@ -463,7 +464,7 @@ server.registerTool('mint_snipe', {
 
   const cfg = baseCfg({
     contract: address, quantity, txPerWallet: tx_per_wallet,
-    at, dryRun: Boolean(dry_run), retryWindowMs: 20000,
+    at, dryRun: Boolean(dry_run), retryWindowMs: 20000, stagger: stagger_ms,
     sequencerUrl: chain.sequencer,
   });
   const ws = wallets(provider, cfg);

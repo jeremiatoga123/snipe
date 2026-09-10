@@ -101,6 +101,11 @@ presisinya meleset 0.00 ms dari target (`setTimeout` polos meleset ~5 ms).
 Kalau jadwalnya tidak ada di chain, pakai `--at`, atau biarkan kosong dan tool
 akan polling simulasi lalu menembak pada yang pertama lolos.
 
+Punya beberapa wallet? `--stagger -20,40,100` memberi tiap wallet target tiba
+berbeda di sekitar batas detik pembukaan: satu mengejar blok pertama (dengan
+risiko kepagian), yang lain menyusul aman. Wallet yang sudah mendarat tidak
+ditembak ulang.
+
 Untuk dipakai AI agent, lihat [AGENT.md](AGENT.md) — ada entrypoint terpisah
 `agent-mint.mjs` yang keluarannya JSON.
 
@@ -137,6 +142,7 @@ node src/index.js mint --mode raw --data 0x161ac21f0000... --value 0.005 --contr
 | `--maxFeeGwei <n>` | patok gas manual (dompet tipis → turunkan ini) |
 | `--gasLimitMultiplier <n>` | pengali gas limit dari hasil estimasi (default 1.3) |
 | `--retries <n>` | percobaan ulang per tx (default 3) |
+| `--stagger <ms,...>` | snipe: target tiba per wallet, mis. `-20,40,100` |
 | `--chain <nama>` | `robinhood`, `base`, `ethereum`, `arbitrum`, ... |
 | `--rpc <url>` | RPC custom |
 

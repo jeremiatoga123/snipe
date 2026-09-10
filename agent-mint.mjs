@@ -74,6 +74,8 @@ function buildConfig(args) {
     retries: num(args.retries) ?? 3,
     simulateBeforeSend: args.noSimulate ? false : true,
     dryRun: Boolean(args.dryRun ?? args.dry),
+    stagger: args.stagger ?? process.env.AGENT_STAGGER,
+    deliveryMs: num(args.deliveryMs),
     json: true,
   };
   if (process.env.RPC_URL) cfg.rpc = [process.env.RPC_URL];

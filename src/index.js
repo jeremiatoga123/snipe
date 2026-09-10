@@ -60,6 +60,7 @@ function loadConfig(args) {
     pollIntervalMs: 'pollIntervalMs', pollTimeoutMs: 'pollTimeoutMs',
     safetyMs: 'safetyMs', burstLeadMs: 'burstLeadMs', burstIntervalMs: 'burstIntervalMs',
     burstWindowMs: 'burstWindowMs', burstMaxInflight: 'burstMaxInflight', deliveryMs: 'deliveryMs',
+    stagger: 'stagger',
   };
   for (const [flag, key] of Object.entries(map)) {
     if (args[flag] !== undefined) cfg[key] = args[flag];
@@ -240,6 +241,8 @@ async function cmdSigs(ctx, args) {
   }
 }
 
+const sg = (v) => (v >= 0 ? '+' : '') + Math.round(v);
+
 async function cmdSnipe(ctx) {
   const { provider, cfg, chain } = ctx;
   requireContract(cfg);
@@ -259,11 +262,15 @@ async function cmdSnipe(ctx) {
       else if (e.type === 'waiting') {
         const s = Math.round(e.waitMs / 1000);
         const sec = Math.floor(e.openAtMs / 1000) * 1000;
-        const sg = (v) => (v >= 0 ? '+' : '') + Math.round(v);
         const plan = e.mode === 'conditional'
           ? `bersyarat: target tiba +${Math.round(e.arrivalMs - sec)}ms, kirim pertama ${sg(e.fireAt - sec)}ms`
           : `polos: target tiba +${Math.round(e.arrivalMs - sec)}ms, kirim ${sg(e.fireAt - sec)}ms (kompensasi pengiriman ${Math.round(e.arrivalMs - e.fireAt)}ms)`;
-        log.info(`${s > 0 ? `menunggu ${s} detik sampai mint buka` : 'mint sudah buka, tembak sekarang'} | ${plan} | batas detik +${Math.round(e.boundaryOffsetMs)}ms via ${e.boundarySource} | sequencer ${e.seqLatencyMs ? Math.round(e.seqLatencyMs) + 'ms' : '-'}`);
+        const stg = e.stagger ? ` | berjenjang per wallet: ${e.stagger.map((v) => sg(v) + 'ms').join(', ')}` : '';
+        log.info(`${s > 0 ? `menunggu ${s} detik sampai mint buka` : 'mint sudah buka, tembak sekarang'} | ${plan}${stg} | batas detik +${Math.round(e.boundaryOffsetMs)}ms via ${e.boundarySource} | sequencer ${e.seqLatencyMs ? Math.round(e.seqLatencyMs) + 'ms' : '-'}`);
+      } else if (e.type === 'staggered') {
+        for (const d of e.detail) log.info(`tembak ${short(d.wallet)} @ ${sg(d.offsetMs)}ms -> ${d.ok ? 'masuk mempool' : 'GAGAL'}`);
+      } else if (e.type === 'sudah-mendarat') { log.ok(`${short(e.wallet)} ternyata sudah mendarat: ${e.hash}`);
+      } else if (e.type === 'already-minted') { log.ok(`${short(e.wallet)} sudah mint on-chain (${e.before} -> ${e.now}); tidak diulang`);
       } else if (e.type === 'countdown') log.info(`sisa ${Math.round(e.remainingMs / 1000)} detik`);
       else if (e.type === 'resync') log.info(`resync: batas detik +${Math.round(e.boundaryOffsetMs)}ms via ${e.boundarySource} | sequencer ${e.seqLatencyMs ? Math.round(e.seqLatencyMs) + 'ms' : '-'} | mode ${e.mode}`);
       else if (e.type === 'polling') log.info(`jadwal tidak diketahui, polling simulasi tiap ${e.intervalMs}ms`);

@@ -389,6 +389,7 @@ export async function snipe({ provider, providers, wallets, cfg, chain, onEvent 
     onEvent({
       type: 'waiting', openAtMs: bundle.openAtMs, waitMs, source: bundle.scheduleSource,
       fireAt: target, mode: firePlan.mode, arrivalMs: firePlan.arrivalMs,
+      stagger: firePlan.perJob ? firePlan.perJob.map((j) => j.offsetMs) : null,
       boundaryOffsetMs: bundle.boundaryOffsetMs, boundarySource: bundle.boundarySource,
       latencyMs: bundle.latencyMs, seqLatencyMs: bundle.seqLatencyMs,
     });
@@ -472,41 +473,49 @@ export async function snipe({ provider, providers, wallets, cfg, chain, onEvent 
   const retryDelayMs = Number(cfg.retryDelayMs ?? 1000);
   const deadline = Date.now() + retryWindowMs;
   let wave = 1;
-  while (!results.some((r) => r.success) && Date.now() < deadline) {
+  while (Date.now() < deadline) {
+    const done = new Set(results.filter((r) => r.success).map((r) => r.wallet.toLowerCase()));
+    const inflight = new Set();
+    for (const u of results.filter((r) => r.hash && !r.success && !r.mined)) {
+      const rc = await provider.getTransactionReceipt(u.hash).catch(() => null);
+      if (rc && rc.status === 1) {
+        u.success = true; u.mined = true; u.blockNumber = rc.blockNumber;
+        done.add(u.wallet.toLowerCase());
+        onEvent({ type: 'sudah-mendarat', wallet: u.wallet, hash: u.hash });
+      } else if (rc) {
+        u.mined = true; u.error = 'tx reverted on-chain';
+      } else {
+        inflight.add(u.wallet.toLowerCase());
+      }
+    }
     if (bundle.profile.seadrop) {
-      let alreadyDone = false;
       for (const a of bundle.armed) {
         if (a.mintedBefore === null || a.mintedBefore === undefined) continue;
+        const w = a.wallet.address.toLowerCase();
+        if (done.has(w)) continue;
         const st = await readMintStats(provider, bundle.address, a.wallet.address);
         if (st && st.minterNumMinted > a.mintedBefore) {
           onEvent({ type: 'already-minted', wallet: a.wallet.address, before: a.mintedBefore, now: st.minterNumMinted });
-          alreadyDone = true;
+          done.add(w);
         }
       }
-      if (alreadyDone) break;
     }
-    const unresolved = results.filter((r) => r.hash && !r.success);
-    if (unresolved.length) {
-      let landed = false;
-      for (const u of unresolved) {
-        const rc = await provider.getTransactionReceipt(u.hash).catch(() => null);
-        if (rc && rc.status === 1) {
-          u.success = true; u.mined = true; u.blockNumber = rc.blockNumber;
-          landed = true;
-        }
-      }
-      if (landed) {
-        onEvent({ type: 'sudah-mendarat', note: 'tx gelombang sebelumnya ternyata sukses; berhenti' });
-        break;
-      }
+    const pending = bundle.armed.filter((a) => {
+      const w = a.wallet.address.toLowerCase();
+      return !done.has(w) && !inflight.has(w);
+    });
+    if (!pending.length) {
+      if (inflight.size) { await sleep(retryDelayMs); continue; }
+      break;
     }
+    if (done.size && cfg.retryOthers === false) break;
     wave++;
     await sleep(retryDelayMs);
+    bundle.fees = await buildFees(provider, cfg).catch(() => bundle.fees);
     const perWallet = Math.max(1, Number(cfg.txPerWallet ?? 1));
-    for (const a of bundle.armed) {
+    for (const a of pending) {
       const nonce = await a.wallet.getNonce('pending');
       a.signed = [];
-      bundle.fees = await buildFees(provider, cfg).catch(() => bundle.fees);
       for (let k = 0; k < perWallet; k++) {
         a.signed.push(await a.wallet.signTransaction({
           chainId: chain.chainId,
@@ -515,7 +524,7 @@ export async function snipe({ provider, providers, wallets, cfg, chain, onEvent 
         }));
       }
     }
-    sent = await fire(providers, bundle, { label: `wave-${wave}`, sequencerUrl: chain.sequencer });
+    sent = await fire(providers, { armed: pending }, { label: `wave-${wave}`, sequencerUrl: chain.sequencer });
     onEvent({ type: 'sent', wave, sent });
     const more = await collect(provider, sent, {
       timeoutMs: Number(cfg.waitTimeoutMs ?? 60000),
@@ -542,13 +551,42 @@ export function firstSendAt(bundle, cfg) {
     return { mode: 'conditional', arrivalMs, sendAt: arrivalMs + burstLeadMs - bundle.seqLatencyMs / 2, startSec };
   }
   const safetyMs = Number(cfg.safetyMs ?? 40);
-  const arrivalMs = computeArrivalAt(startSec, { boundaryOffsetMs: bundle.boundaryOffsetMs, leadMs: leadMs + safetyMs });
   const networkOneWay = haveSeq ? bundle.seqLatencyMs / 2 : (bundle.latencyMs ?? 60) / 2;
   const deliveryMs = Number.isFinite(bundle.deliveryMs) && bundle.deliveryMs > 0 ? bundle.deliveryMs : networkOneWay;
+  const stagger = parseStagger(cfg.stagger);
+  if (stagger.length && bundle.armed.length > 1) {
+    const perJob = [];
+    bundle.armed.forEach((a, i) => {
+      const offsetMs = stagger[Math.min(i, stagger.length - 1)];
+      const arrivalMs = computeArrivalAt(startSec, { boundaryOffsetMs: bundle.boundaryOffsetMs, leadMs: leadMs + offsetMs });
+      for (const raw of a.signed) perJob.push({ wallet: a.wallet.address, raw, offsetMs, arrivalMs, sendAt: arrivalMs - deliveryMs });
+    });
+    const sendAt = Math.min(...perJob.map((j) => j.sendAt));
+    const arrivalMs = Math.min(...perJob.map((j) => j.arrivalMs));
+    return { mode: 'plain', arrivalMs, startSec, sendAt, deliveryMs, perJob };
+  }
+  const arrivalMs = computeArrivalAt(startSec, { boundaryOffsetMs: bundle.boundaryOffsetMs, leadMs: leadMs + safetyMs });
   return { mode: 'plain', arrivalMs, startSec, sendAt: arrivalMs - deliveryMs, deliveryMs };
 }
 
+export function parseStagger(v) {
+  if (v === undefined || v === null || v === '' || v === false) return [];
+  const arr = Array.isArray(v) ? v : String(v).split(',');
+  return arr.map((x) => Number(String(x).trim())).filter((n) => Number.isFinite(n));
+}
+
 export async function fireWaveOne({ providers, bundle, cfg, chain, plan, onEvent = () => {} }) {
+  if (plan.mode === 'plain' && plan.perJob && plan.perJob.length) {
+    const sent = await Promise.all(plan.perJob.map(async (pj) => {
+      if (pj.sendAt > Date.now()) await sleepUntil(pj.sendAt, 0);
+      const sub = { armed: [{ wallet: { address: pj.wallet }, signed: [pj.raw] }] };
+      const label = `wave-1@${pj.offsetMs >= 0 ? '+' : ''}${pj.offsetMs}ms`;
+      const [s] = await fire(providers, sub, { label, dryRun: cfg.dryRun, sequencerUrl: chain.sequencer });
+      return { ...s, offsetMs: pj.offsetMs, sentAtMs: Date.now() };
+    }));
+    onEvent({ type: 'staggered', detail: sent.map((s) => ({ wallet: s.wallet, offsetMs: s.offsetMs, ok: s.ok, sentAtMs: s.sentAtMs })) });
+    return sent;
+  }
   if (cfg.dryRun || plan.mode !== 'conditional') {
     return fire(providers, bundle, { label: 'wave-1', dryRun: cfg.dryRun, sequencerUrl: chain.sequencer });
   }
