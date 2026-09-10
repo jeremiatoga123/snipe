@@ -8,6 +8,8 @@ export const CHAINS = {
     currency: 'ETH',
     alchemy: "robinhood-mainnet",
     sequencer: 'https://sequencer.mainnet.chain.robinhood.com',
+    feed: 'wss://feed.mainnet.chain.robinhood.com',
+    deliveryMs: 300,
   },
   'robinhood-testnet': {
     name: 'Robinhood Chain Testnet',

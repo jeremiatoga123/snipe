@@ -43,6 +43,7 @@ async function pokeSequencer(url) {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_sendRawTransaction', params: ['0x00'] }),
+    signal: AbortSignal.timeout(4000),
   });
   return performance.now() - t0;
 }
@@ -52,10 +53,23 @@ export async function sendToSequencer(url, rawTx) {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_sendRawTransaction', params: [rawTx] }),
+    signal: AbortSignal.timeout(8000),
   });
   const j = await res.json();
   if (j.error) throw new Error(j.error.message ?? 'sequencer menolak');
   return j.result;
+}
+
+export async function measureSequencerLatency(url, samples = 7) {
+  if (!url) return { medianMs: null, minMs: null, samples: 0 };
+  try { await pokeSequencer(url); } catch {}
+  const xs = [];
+  for (let i = 0; i < samples; i++) {
+    try { xs.push(await pokeSequencer(url)); } catch {}
+  }
+  if (!xs.length) return { medianMs: null, minMs: null, samples: 0 };
+  xs.sort((a, b) => a - b);
+  return { medianMs: xs[Math.floor(xs.length / 2)], minMs: xs[0], samples: xs.length };
 }
 
 export async function measureRpcLatency(provider, samples = 9) {
@@ -111,6 +125,61 @@ export async function measureSecondBoundary(provider, { timeoutMs = 2500, sample
     meanMs: xs.reduce((s, x) => s + x, 0) / xs.length,
     windowMs, ok: true, samples: xs.length,
   };
+}
+
+export async function measureSecondBoundaryViaFeed(feedUrl, { seconds = 8, drainTimeoutMs = 20000 } = {}) {
+  if (!feedUrl || typeof WebSocket === 'undefined') return { ok: false, boundaryOffsetMs: 0, samples: 0, source: 'feed' };
+  return new Promise((resolve) => {
+    const firstSeen = new Map();
+    let drainedAt = null, drainSec = null, done = false, ws = null, hardStop = null;
+    const finish = (extra = {}) => {
+      if (done) return;
+      done = true;
+      if (hardStop) clearTimeout(hardStop);
+      try { ws && ws.close(); } catch {}
+      const xs = [...firstSeen.values()].sort((a, b) => a - b);
+      if (!xs.length) return resolve({ ok: false, boundaryOffsetMs: 0, samples: 0, source: 'feed', ...extra });
+      resolve({
+        ok: true, source: 'feed',
+        boundaryOffsetMs: xs[Math.floor(xs.length / 2)],
+        minMs: xs[0], spreadMs: xs[xs.length - 1] - xs[0], samples: xs.length,
+        ...extra,
+      });
+    };
+    try { ws = new WebSocket(feedUrl); } catch (e) { return resolve({ ok: false, boundaryOffsetMs: 0, samples: 0, source: 'feed', error: String(e.message) }); }
+    hardStop = setTimeout(() => finish({ timedOut: true }), drainTimeoutMs + seconds * 1000 + 2000);
+    ws.onerror = () => finish({ error: 'ws error' });
+    ws.onclose = () => finish();
+    ws.onmessage = (e) => {
+      const now = Date.now();
+      let j;
+      try { j = JSON.parse(e.data); } catch { return; }
+      for (const m of j.messages || []) {
+        const ts = m?.message?.message?.header?.timestamp;
+        if (ts == null) continue;
+        if (drainedAt === null) {
+          if (ts >= Math.floor(now / 1000) - 1) { drainedAt = now; drainSec = ts; }
+          continue;
+        }
+        if (ts > drainSec && !firstSeen.has(ts)) firstSeen.set(ts, now % 1000);
+      }
+      if (drainedAt !== null && now - drainedAt >= seconds * 1000) finish();
+    };
+  });
+}
+
+export async function measureBoundaryRobust(provider, feedUrl, opts = {}) {
+  let rpc = null;
+  try { rpc = await measureSecondBoundary(provider, opts.rpc); } catch { rpc = null; }
+  if (rpc && rpc.ok && rpc.samples >= 2) return { ...rpc, source: 'rpc' };
+  const feed = await measureSecondBoundaryViaFeed(feedUrl, opts.feed);
+  if (feed.ok) return feed;
+  if (rpc && rpc.ok) return { ...rpc, source: 'rpc' };
+  return { ok: false, boundaryOffsetMs: 0, samples: 0, source: 'none' };
+}
+
+export function computeArrivalAt(startTimeSec, { boundaryOffsetMs, leadMs = 0 }) {
+  return startTimeSec * 1000 + boundaryOffsetMs + leadMs;
 }
 
 export function computeFireAt(startTimeSec, { boundaryOffsetMs, latencyMs, safetyMs = 40, leadMs = 0 }) {
@@ -226,8 +295,14 @@ export async function preflight({ provider, wallets, cfg, chain, quiet = false }
   }
 
   const lat = await measureRpcLatency(provider);
-  const boundary = await measureSecondBoundary(provider);
-  say(`latensi RPC ${lat.medianMs.toFixed(0)}ms | batas detik chain +${boundary.boundaryOffsetMs.toFixed(0)}ms${boundary.ok ? '' : ' (gagal diukur, pakai 0)'}`);
+  const boundary = await measureBoundaryRobust(provider, chain.feed);
+  const seqLat = await measureSequencerLatency(chain.sequencer, 7);
+  const conditionalOk = chain.sequencer ? await supportsConditional(chain.sequencer) : false;
+  say(
+    `latensi RPC ${lat.medianMs.toFixed(0)}ms | sequencer ${seqLat.medianMs ? seqLat.medianMs.toFixed(0) + 'ms' : '-'}` +
+    ` | batas detik +${boundary.boundaryOffsetMs.toFixed(0)}ms via ${boundary.source}${boundary.ok ? '' : ' (gagal diukur, pakai 0)'}` +
+    ` | bersyarat: ${conditionalOk ? 'ya' : 'tidak'}`
+  );
 
   const { offsetMs, samples } = await measureClockOffset(provider);
 
@@ -242,6 +317,8 @@ export async function preflight({ provider, wallets, cfg, chain, quiet = false }
     address, profile, armed, skipped, gasLimit, fees, maxFee,
     openAtMs, scheduleSource: source, offsetMs,
     latencyMs: lat.medianMs, boundaryOffsetMs: boundary.boundaryOffsetMs, boundaryOk: boundary.ok,
+    boundarySource: boundary.source, seqLatencyMs: seqLat.medianMs, conditionalOk,
+    deliveryMs: cfg.deliveryMs != null ? Number(cfg.deliveryMs) : (chain.deliveryMs ?? null),
     totalTx: armed.length * txPerWallet,
   };
 }
@@ -304,34 +381,38 @@ export async function snipe({ provider, providers, wallets, cfg, chain, onEvent 
   const bundle = await preflight({ provider, wallets, cfg, chain, quiet: cfg.json });
   onEvent({ type: 'armed', bundle });
 
-  const leadMs = Number(cfg.leadMs ?? 0);
-  const safetyMs = Number(cfg.safetyMs ?? 25);
+  let firePlan = { mode: 'plain', sendAt: null, arrivalMs: null };
   if (bundle.openAtMs) {
-    let target = computeFireAt(Math.floor(bundle.openAtMs / 1000), {
-      boundaryOffsetMs: bundle.boundaryOffsetMs,
-      latencyMs: bundle.latencyMs,
-      safetyMs, leadMs,
-    });
+    firePlan = firstSendAt(bundle, cfg);
+    let target = firePlan.sendAt;
     const waitMs = target - Date.now();
     onEvent({
       type: 'waiting', openAtMs: bundle.openAtMs, waitMs, source: bundle.scheduleSource,
-      fireAt: target, boundaryOffsetMs: bundle.boundaryOffsetMs, latencyMs: bundle.latencyMs,
+      fireAt: target, mode: firePlan.mode, arrivalMs: firePlan.arrivalMs,
+      boundaryOffsetMs: bundle.boundaryOffsetMs, boundarySource: bundle.boundarySource,
+      latencyMs: bundle.latencyMs, seqLatencyMs: bundle.seqLatencyMs,
     });
     if (waitMs > 0) {
-      if (waitMs > 20000) {
-        await sleepUntil(target - 15000, 0, (r) => onEvent({ type: 'countdown', remainingMs: r }));
-        const [lat2, b2] = await Promise.all([
+      if (waitMs > 45000) {
+        await sleepUntil(target - 30000, 0, (r) => onEvent({ type: 'countdown', remainingMs: r }));
+        const [lat2, b2, s2] = await Promise.all([
           measureRpcLatency(provider, 7),
-          measureSecondBoundary(provider),
+          measureBoundaryRobust(provider, chain.feed, {
+            rpc: { timeoutMs: 1500, samples: 3 },
+            feed: { seconds: 4, drainTimeoutMs: 6000 },
+          }),
+          measureSequencerLatency(chain.sequencer, 5),
         ]);
-        if (b2.ok) bundle.boundaryOffsetMs = b2.boundaryOffsetMs;
+        if (b2.ok) { bundle.boundaryOffsetMs = b2.boundaryOffsetMs; bundle.boundarySource = b2.source; }
         bundle.latencyMs = lat2.medianMs;
-        target = computeFireAt(Math.floor(bundle.openAtMs / 1000), {
-          boundaryOffsetMs: bundle.boundaryOffsetMs,
-          latencyMs: bundle.latencyMs,
-          safetyMs, leadMs,
+        if (s2.medianMs) bundle.seqLatencyMs = s2.medianMs;
+        firePlan = firstSendAt(bundle, cfg);
+        target = firePlan.sendAt;
+        onEvent({
+          type: 'resync', fireAt: target, mode: firePlan.mode, arrivalMs: firePlan.arrivalMs,
+          boundaryOffsetMs: bundle.boundaryOffsetMs, boundarySource: bundle.boundarySource,
+          latencyMs: bundle.latencyMs, seqLatencyMs: bundle.seqLatencyMs,
         });
-        onEvent({ type: 'resync', boundaryOffsetMs: bundle.boundaryOffsetMs, latencyMs: bundle.latencyMs, fireAt: target });
       }
 
       const warmTargets = [
@@ -370,9 +451,9 @@ export async function snipe({ provider, providers, wallets, cfg, chain, onEvent 
     }
   }
 
-  onEvent({ type: 'firing', at: new Date().toISOString(), txCount: bundle.totalTx });
+  onEvent({ type: 'firing', at: new Date().toISOString(), txCount: bundle.totalTx, mode: firePlan.mode });
   const t0 = Date.now();
-  let sent = await fire(providers, bundle, { label: 'wave-1', dryRun: cfg.dryRun, sequencerUrl: chain.sequencer });
+  let sent = await fireWaveOne({ providers, bundle, cfg, chain, plan: firePlan, onEvent });
   onEvent({ type: 'sent', wave: 1, elapsedMs: Date.now() - t0, sent });
 
   if (cfg.dryRun) {
@@ -450,6 +531,63 @@ export async function snipe({ provider, providers, wallets, cfg, chain, onEvent 
   return { bundle, results, stats, waves: wave };
 }
 
+export function firstSendAt(bundle, cfg) {
+  const startSec = Math.floor(bundle.openAtMs / 1000);
+  const leadMs = Number(cfg.leadMs ?? 0);
+  const haveSeq = Number.isFinite(bundle.seqLatencyMs) && bundle.seqLatencyMs > 0;
+  const conditional = cfg.conditional === true && bundle.conditionalOk && haveSeq;
+  if (conditional) {
+    const arrivalMs = computeArrivalAt(startSec, { boundaryOffsetMs: bundle.boundaryOffsetMs, leadMs });
+    const burstLeadMs = Number(cfg.burstLeadMs ?? 50);
+    return { mode: 'conditional', arrivalMs, sendAt: arrivalMs + burstLeadMs - bundle.seqLatencyMs / 2, startSec };
+  }
+  const safetyMs = Number(cfg.safetyMs ?? 40);
+  const arrivalMs = computeArrivalAt(startSec, { boundaryOffsetMs: bundle.boundaryOffsetMs, leadMs: leadMs + safetyMs });
+  const networkOneWay = haveSeq ? bundle.seqLatencyMs / 2 : (bundle.latencyMs ?? 60) / 2;
+  const deliveryMs = Number.isFinite(bundle.deliveryMs) && bundle.deliveryMs > 0 ? bundle.deliveryMs : networkOneWay;
+  return { mode: 'plain', arrivalMs, startSec, sendAt: arrivalMs - deliveryMs, deliveryMs };
+}
+
+export async function fireWaveOne({ providers, bundle, cfg, chain, plan, onEvent = () => {} }) {
+  if (cfg.dryRun || plan.mode !== 'conditional') {
+    return fire(providers, bundle, { label: 'wave-1', dryRun: cfg.dryRun, sequencerUrl: chain.sequencer });
+  }
+  const jobs = [];
+  for (const a of bundle.armed) for (const raw of a.signed) jobs.push({ wallet: a.wallet.address, raw });
+  const perJobInflight = Math.max(1, Math.floor(Number(cfg.burstMaxInflight ?? 3) / Math.max(1, jobs.length)));
+  const bursts = await Promise.all(jobs.map((job) =>
+    conditionalSpray(chain.sequencer, job.raw, plan.startSec, {
+      startAtMs: null,
+      intervalMs: Number(cfg.burstIntervalMs ?? 150),
+      windowMs: Number(cfg.burstWindowMs ?? 1500),
+      maxInflight: perJobInflight,
+    }).then((r) => ({ job, r }))
+  ));
+  const sent = [];
+  const fallback = [];
+  for (const { job, r } of bursts) {
+    if (r.accepted) {
+      sent.push({
+        ...job, ok: true, hash: r.accepted.hash, label: 'wave-1-cond',
+        shots: r.shots, rejected: r.rejected, sentAtMs: r.accepted.sentAtMs, acceptedAtMs: r.accepted.acceptedAtMs,
+      });
+    } else fallback.push(job);
+  }
+  onEvent({
+    type: 'burst', accepted: sent.length, fallback: fallback.length,
+    detail: bursts.map(({ job, r }) => ({
+      wallet: job.wallet, shots: r.shots, rejected: r.rejected, errors: r.errors,
+      accepted: Boolean(r.accepted), lastReason: r.lastReason,
+      sentAtMs: r.accepted?.sentAtMs ?? null, acceptedAtMs: r.accepted?.acceptedAtMs ?? null,
+    })),
+  });
+  if (fallback.length) {
+    const sub = { armed: fallback.map((job) => ({ wallet: { address: job.wallet }, signed: [job.raw] })) };
+    sent.push(...await fire(providers, sub, { label: 'wave-1-plain', sequencerUrl: chain.sequencer }));
+  }
+  return sent;
+}
+
 export function printArmed(bundle, chain) {
   log.step('Sniper siap');
   log.plain(`   kontrak     : ${bundle.address} ${bundle.profile.name ? `(${bundle.profile.name})` : ''}`);
@@ -481,9 +619,10 @@ export function printResults(res, chain) {
 }
 
 export async function conditionalSpray(sequencerUrl, rawTx, timestampMin, {
-  startAtMs,
-  intervalMs = 12,
-  windowMs = 1200,
+  startAtMs = null,
+  intervalMs = 45,
+  windowMs = 1500,
+  maxInflight = 6,
   onShot = () => {},
 } = {}) {
   if (startAtMs && startAtMs > Date.now()) await sleepUntil(startAtMs, 0);
@@ -491,7 +630,7 @@ export async function conditionalSpray(sequencerUrl, rawTx, timestampMin, {
   const deadline = Date.now() + windowMs;
   const inflight = new Set();
   let accepted = null;
-  let shots = 0, rejected = 0, errors = 0;
+  let shots = 0, rejected = 0, errors = 0, lastReason = null;
   const t0 = Date.now();
 
   const shoot = async (n) => {
@@ -504,28 +643,36 @@ export async function conditionalSpray(sequencerUrl, rawTx, timestampMin, {
           jsonrpc: '2.0', id: n, method: 'eth_sendRawTransactionConditional',
           params: [rawTx, { timestampMin }],
         }),
+        signal: AbortSignal.timeout(5000),
       });
       const j = await res.json();
-      if (j.result && !accepted) {
-        accepted = { hash: j.result, shot: n, atMs: Date.now(), elapsedMs: Date.now() - t0, rttMs: Date.now() - s0 };
+      if (j.result) {
+        if (!accepted) accepted = { hash: j.result, shot: n, sentAtMs: s0, acceptedAtMs: Date.now(), rttMs: Date.now() - s0 };
       } else if (j.error) {
         rejected++;
-        onShot({ n, ok: false, reason: j.error.message, rttMs: Date.now() - s0 });
+        lastReason = j.error.message;
+        onShot({ n, ok: false, reason: lastReason, rttMs: Date.now() - s0 });
       }
     } catch (e) {
       errors++;
+      lastReason = String(e.message);
     }
   };
 
   while (!accepted && Date.now() < deadline) {
-    const n = ++shots;
-    const pr = shoot(n).finally(() => inflight.delete(pr));
-    inflight.add(pr);
-    await sleep(intervalMs);
+    if (inflight.size < maxInflight) {
+      const n = ++shots;
+      const pr = shoot(n);
+      inflight.add(pr);
+      pr.finally(() => inflight.delete(pr));
+      await sleep(intervalMs);
+    } else {
+      await sleep(5);
+    }
   }
   await Promise.allSettled([...inflight]);
 
-  return { accepted, shots, rejected, errors, elapsedMs: Date.now() - t0 };
+  return { accepted, shots, rejected, errors, lastReason, elapsedMs: Date.now() - t0 };
 }
 
 export async function supportsConditional(sequencerUrl) {
@@ -536,6 +683,7 @@ export async function supportsConditional(sequencerUrl) {
         jsonrpc: '2.0', id: 1, method: 'eth_sendRawTransactionConditional',
         params: ['0x00', { timestampMin: 1 }],
       }),
+      signal: AbortSignal.timeout(5000),
     });
     const j = await res.json();
     return !(j.error && j.error.code === -32601);

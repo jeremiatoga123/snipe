@@ -58,11 +58,15 @@ function loadConfig(args) {
     watchIntervalMs: 'watchIntervalMs', confirmations: 'confirmations',
     at: 'at', leadMs: 'leadMs', retryWindowMs: 'retryWindowMs', dryRun: 'dryRun',
     pollIntervalMs: 'pollIntervalMs', pollTimeoutMs: 'pollTimeoutMs',
+    safetyMs: 'safetyMs', burstLeadMs: 'burstLeadMs', burstIntervalMs: 'burstIntervalMs',
+    burstWindowMs: 'burstWindowMs', burstMaxInflight: 'burstMaxInflight', deliveryMs: 'deliveryMs',
   };
   for (const [flag, key] of Object.entries(map)) {
     if (args[flag] !== undefined) cfg[key] = args[flag];
   }
   if (args.rpc !== undefined) cfg.rpc = [args.rpc];
+  if (args.conditional) cfg.conditional = true;
+  if (args.noConditional) cfg.conditional = false;
   if (!cfg.chain) cfg.chain = 'robinhood';
   return cfg;
 }
@@ -254,12 +258,21 @@ async function cmdSnipe(ctx) {
       if (e.type === 'armed') printArmed(e.bundle, chain);
       else if (e.type === 'waiting') {
         const s = Math.round(e.waitMs / 1000);
-        log.info(s > 0 ? `menunggu ${s} detik sampai mint buka...` : 'mint sudah buka, tembak sekarang');
+        const sec = Math.floor(e.openAtMs / 1000) * 1000;
+        const sg = (v) => (v >= 0 ? '+' : '') + Math.round(v);
+        const plan = e.mode === 'conditional'
+          ? `bersyarat: target tiba +${Math.round(e.arrivalMs - sec)}ms, kirim pertama ${sg(e.fireAt - sec)}ms`
+          : `polos: target tiba +${Math.round(e.arrivalMs - sec)}ms, kirim ${sg(e.fireAt - sec)}ms (kompensasi pengiriman ${Math.round(e.arrivalMs - e.fireAt)}ms)`;
+        log.info(`${s > 0 ? `menunggu ${s} detik sampai mint buka` : 'mint sudah buka, tembak sekarang'} | ${plan} | batas detik +${Math.round(e.boundaryOffsetMs)}ms via ${e.boundarySource} | sequencer ${e.seqLatencyMs ? Math.round(e.seqLatencyMs) + 'ms' : '-'}`);
       } else if (e.type === 'countdown') log.info(`sisa ${Math.round(e.remainingMs / 1000)} detik`);
-      else if (e.type === 'resync') log.info(`resync jam, offset ${e.offsetMs.toFixed(0)}ms`);
+      else if (e.type === 'resync') log.info(`resync: batas detik +${Math.round(e.boundaryOffsetMs)}ms via ${e.boundarySource} | sequencer ${e.seqLatencyMs ? Math.round(e.seqLatencyMs) + 'ms' : '-'} | mode ${e.mode}`);
       else if (e.type === 'polling') log.info(`jadwal tidak diketahui, polling simulasi tiap ${e.intervalMs}ms`);
-      else if (e.type === 'firing') log.step(`TEMBAK ${e.txCount} tx`);
-      else if (e.type === 'sent') {
+      else if (e.type === 'firing') log.step(`TEMBAK ${e.txCount} tx (${e.mode})`);
+      else if (e.type === 'burst') {
+        for (const d of e.detail) {
+          log.info(`burst ${short(d.wallet)}: ${d.shots} tembakan, ${d.rejected} ditolak gratis${d.accepted ? `, DITERIMA (kirim +${d.sentAtMs % 1000}ms, jawab +${d.acceptedAtMs % 1000}ms)` : `, tidak diterima -> fallback polos (${d.lastReason ?? '-'})`}`);
+        }
+      } else if (e.type === 'sent') {
         const ok = e.sent.filter((s) => s.ok).length;
         log.info(`gelombang ${e.wave}: ${ok}/${e.sent.length} tx masuk mempool${e.elapsedMs !== undefined ? ` dalam ${e.elapsedMs}ms` : ''}`);
       }

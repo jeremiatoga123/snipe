@@ -107,9 +107,10 @@ Menambahkan salinan alih-alih mengganti, jadi jumlah tx dan kegagalan di
 
 ## Kebersihan (bukan bug)
 
-- `conditionalSpray` dan `supportsConditional` diekspor dan didokumentasikan
-  panjang, tapi tidak dipanggil dari mana pun. Sengaja — terbukti lebih lambat
-  dari Jakarta. Tetap perlu ditandai supaya tidak dikira aktif.
+- `conditionalSpray` dan `supportsConditional` sekarang dipakai lewat
+  `fireWaveOne`, tapi hanya kalau `--conditional` diberikan. Default-nya polos,
+  karena jalur bersyarat terbukti ~600 ms lebih lambat di sequencer Robinhood
+  (lihat H7).
 - `preflight` diimpor di `mcp-server.mjs` tapi tidak dipakai.
 - `writeEnvVar` membuang semua komentar dan baris kosong di `.env` saat menulis ulang.
 
@@ -149,3 +150,55 @@ tempat baru — `sendMint`, tiket MCP, gelombang susulan sniper.
 
 Aturan untuk perubahan berikutnya: apa pun yang bisa mengirim transaksi kedua
 harus lebih dulu membaca keadaan on-chain, bukan mengandalkan variabel di memori.
+
+### H5. Handler `resync` di CLI membaca field yang tidak pernah dikirim
+`src/index.js` — `cmdSnipe`
+
+`log.info(\`resync jam, offset ${e.offsetMs.toFixed(0)}ms\`)`, padahal event
+`resync` sudah lama memancarkan `boundaryOffsetMs`, bukan `offsetMs`.
+`undefined.toFixed` melempar TypeError di dalam `onEvent`, yang merambat keluar
+dari `snipe()`.
+
+**Akibat:** setiap snipe dengan waktu tunggu lebih dari 20 detik crash tepat di
+T−15 detik. Tidak pernah terpicu karena semua dry-run kebetulan menunggu kurang
+dari 20 detik. Ditemukan 10 September saat membaca ulang handler-nya.
+
+### H6. Kompensasi latensi memakai besaran yang salah, dua kali
+`src/sniper.js` — `computeFireAt` / `firstSendAt`
+
+Versi pertama mengurangi setengah RTT ke **Alchemy** (7 ms dari VPS Singapura),
+padahal transaksinya terbang ke sequencer di Ohio. Versi kedua mengurangi
+setengah RTT ke **sequencer** (117 ms). Dua-duanya salah besaran: yang harus
+dikompensasi adalah waktu dari kirim sampai *diterima* sequencer, dan itu
+diukur ~430 ms lewat Alchemy, ~630 ms lewat jalur langsung — ada ~500 ms proses
+ingest di luar jaringan.
+
+Diukur dengan transaksi sungguhan dari wallet debu, 10 September 2026:
+
+| Kompensasi | Mendarat |
+|---|---|
+| 3,5 ms (RTT Alchemy/2) | blok ke-5 |
+| 117 ms (RTT sequencer/2), jalur langsung | blok ke-8 |
+| 117 ms, lewat Alchemy | blok ke-5 |
+| **300 ms, Alchemy + langsung** | **blok ke-2 dan ke-3** |
+
+**Akibat sebelum diperbaiki:** setiap snipe mendarat ~300 ms lebih lambat dari
+yang bisa dicapai. **Sekarang:** `deliveryMs` per chain di `chains.js`.
+
+### H7. Jalur bersyarat diasumsikan gratis dan cepat
+Riset menyimpulkan `eth_sendRawTransactionConditional` menolak tembakan yang
+kepagian secara gratis, jadi bisa disemprot agresif. Benar untuk syarat yang jauh
+(+3 detik ditolak seketika), **salah** untuk syarat yang dekat: tembakan
+kepagian *ditahan* dan baru diproses ~+800 ms, dan siblingnya ditolak sebagai
+duplikat. Uji dengan target sesudah batas detik pun tetap +800 ms, karena
+endpoint langsung memang lambat menerima tx apa pun. Sekarang opt-in.
+
+---
+
+## Pelajaran tambahan
+
+Tiga bug di atas punya akar yang sama: **mengukur hal yang mudah diukur, lalu
+mengira itu hal yang penting.** RTT `poke` ke sequencer mudah diukur dan
+stabil, tapi bukan waktu yang dialami transaksi sungguhan. Satu-satunya
+pengukuran yang sah untuk sniper adalah transaksi sungguhan yang dicatat blok
+pendaratannya, dan itu murah: 21.000 gas, ~$0,02.

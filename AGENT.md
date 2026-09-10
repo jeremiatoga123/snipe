@@ -93,8 +93,9 @@ Prosesnya:
 1. **Preflight** — scan kontrak, susun calldata, estimasi gas, ambil nonce,
    **tandatangani semua tx di depan**.
 2. **Sinkron jam** — ukur selisih jam mesin terhadap timestamp blok.
-3. **Tunggu** — tidur sampai ~15 detik sebelum buka, resync jam, lalu tidur
-   presisi (busy-wait 20 ms terakhir).
+3. **Tunggu** — tidur sampai ~30 detik sebelum buka, ukur ulang batas detik dan
+   latensi, panaskan koneksi di T−6 dan T−0,9 detik, lalu tidur presisi
+   (busy-wait 20 ms terakhir).
 4. **Tembak** — broadcast semua tx yang sudah ditandatangani serentak ke
    semua RPC. Yang tersisa saat detik pembukaan hanya satu `eth_sendRawTransaction`.
 5. **Susulan** — kalau semua gagal, tanda tangan ulang dengan nonce terbaru dan
@@ -168,14 +169,24 @@ Cara sekarang, tiga besaran diukur langsung:
 |---|---|---|
 | Jam mesin | referensi waktu (NTP aktif) | tersinkron |
 | `measureSecondBoundary` | kapan chain benar-benar masuk detik baru | **~300 ms** setelah detik UTC bulat |
-| `measureRpcLatency` | waktu terbang tx ke sequencer | **28 ms** (median) |
+| `measureRpcLatency` | RTT baca ke RPC (untuk deteksi batas detik) | **6–28 ms** |
+| `measureSequencerLatency` | RTT jaringan ke endpoint sequencer | **235 ms** (Singapura) |
+| `deliveryMs` | kirim → diterima sequencer, diukur dengan tx sungguhan | **~430 ms** via Alchemy; dipatok 300 |
 
 ```
-fireAt = startTime*1000 + boundaryOffset + safetyMs - latensi/2 + leadMs
+tiba   = startTime*1000 + batasDetik + safetyMs + leadMs
+kirim  = tiba - deliveryMs          (deliveryMs Robinhood: 300, di chains.js)
 ```
 
-Waktu tembak dihitung ulang ~15 detik sebelum buka, karena kedua besaran bisa
-bergeser selama menunggu berjam-jam.
+`deliveryMs` adalah waktu dari **kirim sampai sequencer menerima**, bukan RTT
+jaringan. Ini pelajaran mahal: RTT jaringan ke sequencer 235 ms, tapi transaksi
+sungguhan baru di-ack 750 ms lewat jalur langsung dan ~430 ms lewat Alchemy.
+Selisihnya adalah waktu proses ingest sequencer, dan tidak bisa dipangkas dengan
+VPS yang lebih dekat.
+
+Waktu tembak dihitung ulang ~30 detik sebelum buka, karena besaran-besaran itu
+bisa bergeser selama menunggu berjam-jam. Kalau RPC gagal, batas detik diambil
+dari feed sequencer sebagai cadangan.
 
 **Batas detik diambil dari MEDIAN beberapa sampel, bukan minimum.** Tiap sampel
 bernilai `batas_sebenarnya + fase_blok` (0–102 ms), jadi minimum terlihat menarik
@@ -183,9 +194,12 @@ secara teori — tapi terbukti salah di lapangan: menembak berdasarkan minimum
 (+294 ms) membuat tx tiba sebelum chain masuk detik target, artinya revert.
 Median (+302 ms) lolos.
 
-`safetyMs` (default 25) mengatur condongnya. Menaikkannya = lebih aman tapi lebih
-lambat. Menurunkannya bisa menyelipkan tx ke blok pertama detik itu — hemat
-~100 ms — tapi jendelanya cuma belasan ms dan gagal berarti gas terbakar.
+`safetyMs` (default 40) mengatur condongnya. Menaikkannya = lebih aman tapi lebih
+lambat. `deliveryMs` (default 300 untuk Robinhood) menentukan seberapa awal
+tembakan dilepas; dengan nilai itu tx mendarat di blok ke-2/ke-3 detik target
+tanpa kepagian. Menaikkannya ke ~400 mengejar blok pertama, tapi jitter
+pengiriman ±100 ms membuat sebagian tembakan tiba sebelum detik target dan
+revert.
 
 Terverifikasi di VPS, tiga percobaan berturut-turut: bangun meleset **0,2 ms**,
 dan pada saat itu blok berstempel detik target sudah ada — jadi tx valid, bukan
@@ -224,13 +238,26 @@ duplikat, tidak ada risiko dobel mint.
 Untuk membaca, Alchemy tetap yang terbaik: terukur **3–4 blok lebih dulu** tahu
 blok baru dibanding RPC publik (yang di balik Cloudflare).
 
-### Yang masih belum terjawab
+### Jalur mana yang lebih cepat: terjawab
 
-Jalur mana yang sebenarnya lebih cepat mengantar tx — Alchemy (28 ms ke POP Asia,
-lalu diteruskan ke Ohio) atau langsung ke sequencer (224 ms RTT Jakarta–Ohio) —
-**belum bisa disimpulkan**. Empat transaksi uji memberi 204–1020 ms lag inklusi
-di kedua jalur; variansinya lebih besar dari selisih yang mau diukur. Karena
-kita menembak ke keduanya sekaligus, yang tercepat menang otomatis.
+Diukur 10 September 2026 dari VPS Singapura dengan transaksi sungguhan,
+margin 40 ms, kompensasi 117 ms (RTT/2):
+
+| Jalur | Ack | Mendarat |
+|---|---|---|
+| Langsung ke sequencer | **750 ms** | blok ke-8 detik itu |
+| Alchemy | **426 ms** | blok ke-5 |
+| Keduanya (`Promise.any`) | Alchemy menang, 488 ms | blok ke-5 |
+
+Endpoint langsung menjawab *poke* dalam 235 ms, tapi transaksi asli baru diterima
+750 ms kemudian: ada ~500 ms proses di sisi ingest. Alchemy lebih cepat.
+
+Setelah kompensasi diganti ke `deliveryMs = 300` (kirim ~60–90 ms **sebelum**
+detik bulat, lewat Alchemy + langsung): mendarat di **blok ke-2 dan ke-3**,
+tidak ada yang kepagian. Itu default sekarang.
+
+Konsekuensi untuk kolokasi: VPS di us-east-2 hanya memangkas ~230 ms
+perjalanan; ~500 ms proses ingest tetap ada. Tidak sepadan.
 
 ## Contoh pemakaian dari agent
 
@@ -291,6 +318,9 @@ Sebabnya RTT 225ms (Jakarta–Ohio) lebih besar dari dua kali interval blok, jad
 waktu tiba tiap tembakan tersebar dan tidak bisa dikendalikan halus. Total biaya
 90 tembakan: 0,0000066 ETH — hanya yang diterima yang berbayar.
 
-Nilainya ada di tempat lain: **menghapus risiko revert sepenuhnya**, sehingga
-boleh menembak seagresif apa pun tanpa taruhan gas. Dari server di us-east-2
-(RTT ~2ms) strategi ini baru menjadi menentukan.
+**Diuji ulang dengan target tiba sesudah batas detik (+273 … +339 ms):** tetap
+mendarat di blok ke-8 sampai ke-10, ack 795–833 ms. Jalur bersyarat memakai
+ingest yang sama lambatnya dengan jalur langsung, jadi ia bukan pemercepat dan
+bukan pula jaring pengaman yang murah — tembakan yang kepagian *ditahan* sampai
+~+800 ms, bukan ditolak. Karena itu bersyarat sekarang **opt-in** (`--conditional`),
+bukan default.
